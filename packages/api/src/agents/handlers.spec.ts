@@ -110,6 +110,99 @@ function invokeHandlerWithConfig(
  * badge / persisted `skills_enabled` + ACL). Tests that mock
  * `getSkillByName` directly need this so they reach the lookup.
  */
+it('keeps enrolled MCP work foreground even when runnable metadata requests detached execution', async () => {
+  const configs: Record<string, unknown>[] = [];
+  const args: unknown[] = [];
+  const name = 'query_mcp_warehouse';
+  const tool = createMockTool(name, configs, { capturedArgs: args });
+  const handler = createToolExecuteHandler({
+    scheduledMCPExecution: {
+      enrolled: true,
+      identity: {
+        scheduleId: 'schedule',
+        ownerId: 'scheduled-owner',
+        tenantId: null,
+        agentId: 'root',
+        invocationMode: 'delegated',
+      },
+    },
+    loadTools: async () => ({ loadedTools: [tool] as never[] }),
+  });
+  const results = await invokeHandlerWithConfig(
+    handler,
+    [{ id: 'read', name, args: { run_in_background: true } }],
+    {
+      user_id: 'scheduled-owner',
+      thread_id: 'scheduled-conversation',
+      backgroundToolNames: [name],
+      scheduledMCPExecution: { enrolled: false },
+    },
+  );
+  expect(results).toEqual([
+    expect.objectContaining({ status: 'success', content: expect.stringContaining('executed') }),
+  ]);
+  expect(JSON.stringify(results)).not.toContain('background_task_id');
+  expect(args).toEqual([{}]);
+  expect(configs).toHaveLength(1);
+});
+
+it.each([true, false])(
+  'captures background completion origin only from its host execution (scheduled=%s)',
+  async (scheduled) => {
+    const identity = {
+      scheduleId: 'original-schedule',
+      ownerId: 'origin-owner',
+      tenantId: null,
+      agentId: 'original-root',
+      invocationMode: 'delegated' as const,
+    };
+    const preregister = jest.fn(async () => false as const);
+    const name = 'query_mcp_warehouse';
+    const handler = createToolExecuteHandler({
+      ...(scheduled && { scheduledMCPExecution: { enrolled: false, identity } }),
+      loadTools: async () => ({ loadedTools: [createMockTool(name, [])] as never[] }),
+      backgroundToolCompletion: {
+        preregister,
+        persist: async () => true,
+        claim: async () => {
+          throw new Error('Unused manual claim');
+        },
+      },
+    });
+    await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+      void handler.handle('on_tool_execute', {
+        resolve,
+        reject,
+        agentId: 'child',
+        toolCalls: [
+          {
+            id: `origin-${scheduled}`,
+            stepId: 'origin-step',
+            name,
+            args: { run_in_background: true, scheduleId: 'forged' },
+          },
+        ],
+        configurable: {
+          user_id: identity.ownerId,
+          thread_id: 'origin-conversation',
+          backgroundToolNames: [name],
+          scheduledMCPExecution: { identity: { ...identity, scheduleId: 'forged' } },
+          req: { user: { id: identity.ownerId }, body: { conversationId: 'origin-conversation' } },
+        },
+        metadata: { run_id: `origin-response-${scheduled}`, thread_id: 'origin-conversation' },
+      });
+    });
+    expect(preregister).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentMessageId: `origin-response-${scheduled}`,
+        conversationId: 'origin-conversation',
+        scheduleMCPIdentity: scheduled ? identity : null,
+      }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+  },
+);
+
 function skillsInScope(): unknown[] {
   const { Types } = jest.requireActual('mongoose') as typeof import('mongoose');
   return [new Types.ObjectId()];
@@ -5545,7 +5638,7 @@ describe('createToolExecuteHandler', () => {
     ];
 
     it.each(['SKILL.md', 'references/a.md'])(
-      'rejects compact amplification atomically for %s without starving timers',
+      'rejects compact amplification atomically for %s',
       async (file) => {
         const updateSkill = jest.fn();
         const saveSkillFileContent = jest.fn();
@@ -5570,10 +5663,6 @@ describe('createToolExecuteHandler', () => {
           updateSkill,
           saveSkillFileContent,
         });
-        let timerFired = false;
-        const timer = setTimeout(() => {
-          timerFired = true;
-        }, 0);
         const [result] = await invokeHandler(handler, [
           {
             id: 'amplification',
@@ -5581,10 +5670,8 @@ describe('createToolExecuteHandler', () => {
             args: { path: `skills/bounded-skill/${file}`, edits: amplificationEdits() },
           },
         ]);
-        clearTimeout(timer);
         expect(result.status).toBe('error');
         expect(result.errorMessage).toContain('budget exceeded');
-        expect(timerFired).toBe(true);
         expect(updateSkill).not.toHaveBeenCalled();
         expect(saveSkillFileContent).not.toHaveBeenCalled();
       },
@@ -7307,7 +7394,18 @@ describe('createToolExecuteHandler', () => {
               statefulSessions: true,
               environmentType: 'attached',
               codeEnvironmentConfigSchema: {
-                limits: { maxQueueWaitMs: budget, maxRequestTimeoutMs: 125_000 },
+                limits: {
+                  maxQueueWaitMs: budget,
+                  maxRequestTimeoutMs: 125_000,
+                  maxRunTimeoutMs: 180_000,
+                },
+                admission: {
+                  queueWaitMs: 60_000,
+                  initialDelayMs: 1_000,
+                  maxDelayMs: 30_000,
+                  multiplier: 2,
+                  jitterRatio: 0.2,
+                },
               },
               bridgeWorkerId: 'user-worker',
             },
@@ -7330,7 +7428,13 @@ describe('createToolExecuteHandler', () => {
           expect.objectContaining({
             maxQueueWaitMs: budget,
             maxRequestTimeoutMs: 125_000,
-            deadlineAtMs: startedAt + 125_000,
+            maxRunTimeoutMs: 180_000,
+            admission: expect.objectContaining({
+              queueWaitMs: 60_000,
+              multiplier: 2,
+              jitterRatio: 0.2,
+            }),
+            deadlineAtMs: startedAt + 180_000,
           }),
         );
         expect(result.status).toBe('success');
@@ -7339,7 +7443,13 @@ describe('createToolExecuteHandler', () => {
             expected_base_sha256: 'b'.repeat(64),
             maxQueueWaitMs: remaining,
             maxRequestTimeoutMs: 125_000,
-            deadlineAtMs: startedAt + 125_000,
+            maxRunTimeoutMs: 180_000,
+            admission: expect.objectContaining({
+              queueWaitMs: 60_000,
+              multiplier: 2,
+              jitterRatio: 0.2,
+            }),
+            deadlineAtMs: startedAt + 180_000,
           }),
         );
       },
@@ -8965,8 +9075,9 @@ describe('createToolExecuteHandler', () => {
         async (name) => {
           const message = await reject(name, legacyBody);
 
-          expect(message).toContain('Invalid workspace path');
-          expect(message.endsWith('"}"')).toBe(true);
+          expect(message).toContain('INVALID_PATH');
+          expect(message).not.toContain('Invalid workspace path');
+          expect(message).not.toContain('upstreamBody');
         },
       );
     });

@@ -58,6 +58,7 @@ const {
   createRepositoryInstructionLoader,
   resolveAttachedWorkspaceCommandTimeoutMax,
   resolveAttachedWorkspaceQueueWaitMs,
+  resolveAttachedWorkspaceAdmissionOptions,
   resolveAttachedWorkspaceRequestTimeoutMs,
   createContextProgrammaticBashTool,
   resolveCodeExecutionContext,
@@ -2409,6 +2410,9 @@ async function loadToolsForExecution({
               ),
               codeApiMaxRetryWaitMs: req.config?.endpoints?.agents?.codeApiMaxRetryWaitMs,
               maxRequestTimeoutMs: resolveAttachedWorkspaceRequestTimeoutMs(
+                codeExecutionContext.codeEnvironmentConfigSchema,
+              ),
+              ...resolveAttachedWorkspaceAdmissionOptions(
                 codeExecutionContext.codeEnvironmentConfigSchema,
               ),
               minCommandAdmissionMs:
