@@ -139,6 +139,8 @@ export const excludedKeys = new Set([
   'agentEventActorLegacyTurn',
   'subagentThread',
   'title',
+  'titleSetByUser',
+  'titleRevision',
   'iconURL',
   'greeting',
   'endpoint',
@@ -2544,6 +2546,8 @@ export const interfaceSchema = z
     customWelcome: z.string().optional(),
     mcpServers: mcpServersSchema.optional(),
     modelSelect: z.boolean().optional(),
+    /** Enable only after every API replica supports title ownership and old title jobs drain. */
+    runningChatRename: z.boolean().default(false),
     /** Milliseconds between syntax highlights while a code block streams. */
     codeHighlightThrottleMs: z.number().int().min(0).max(60_000).default(300),
     /** Most agents the agents panel selector lists before a search term is
@@ -2768,6 +2772,7 @@ export const interfaceSchema = z
   })
   .default({
     modelSelect: true,
+    runningChatRename: false,
     codeHighlightThrottleMs: 300,
     agentSelectorLimit: DEFAULT_AGENT_SELECTOR_LIMIT,
     parameters: true,
@@ -2872,6 +2877,9 @@ export const turnstileSchema = z.object({
 
 export type TTurnstileConfig = z.infer<typeof turnstileSchema>;
 
+/** Distinguishes collector acceptance from the proxy's silent 204 authentication drop. */
+export const RUM_COLLECTOR_ACK_HEADER = 'x-librechat-rum-accepted';
+
 export type TRumConfig = {
   provider: 'hyperdx';
   enabled: boolean;
@@ -2885,6 +2893,8 @@ export type TRumConfig = {
   advancedNetworkCapture?: boolean;
   sampleRate?: number;
   environment?: string;
+  /** Opt-in, proxy mode only: export client logger warnings/errors as OTLP logs via the RUM proxy. */
+  clientLogs?: boolean;
 };
 
 export type StartupConfigContext = 'share';
@@ -2977,7 +2987,21 @@ export function resolveMCPAppsPolicy(
   };
 }
 
+export const CONVERSATION_TITLE_OWNERSHIP_VERSION = 1 as const;
+
+/** Missing capability means an older replica, even when its YAML has the new option. */
+export function supportsConversationTitleOwnership(config?: {
+  conversationTitleOwnershipVersion?: typeof CONVERSATION_TITLE_OWNERSHIP_VERSION;
+  interface?: Pick<TInterfaceConfig, 'runningChatRename'>;
+}): boolean {
+  return (
+    config?.conversationTitleOwnershipVersion === CONVERSATION_TITLE_OWNERSHIP_VERSION &&
+    config.interface?.runningChatRename === true
+  );
+}
+
 export type TStartupConfig = {
+  conversationTitleOwnershipVersion?: typeof CONVERSATION_TITLE_OWNERSHIP_VERSION;
   appTitle: string;
   socialLogins?: string[];
   langfuseFanoutEnabled?: boolean;
