@@ -18,6 +18,7 @@ const {
   getBalanceConfig,
   omitTitleOptions,
   getProviderConfig,
+  resolveTitleConfig,
   formatMemoryContext,
   createCachedTokenCounter,
   applyContextToAgent,
@@ -45,6 +46,8 @@ const {
   buildPendingAction,
   toClientPendingAction,
   captureCodeExecutionApprovalBinding,
+  captureRunToolApprovalBindings,
+  describeRememberedToolApprovals,
   computeAgentRequestFingerprint,
   computeLegacyAgentRequestFingerprint,
   getRunDiscoveredTools,
@@ -59,8 +62,12 @@ const {
   buildToolApprovalExecutionConfig,
   collectAttachedCodeEnvironmentAgentIds,
   collectAttachedCodeEnvironmentPolicySettings,
+  collectAttachedCodeApprovalPolicies,
+  collectAttachedCodeRoutePolicies,
   buildAttachedCodeEnvironmentAdmissionHooks,
   resolveAttachedCodeApprovalMode,
+  resolvePersistedCodeApprovalMode,
+  getCodeApprovalPreservedFields,
   markNativeCodeToolApprovalRequests,
   markToolApprovalAllowAlways,
   resolveRunToolApprovalAllows,
@@ -139,6 +146,7 @@ const {
   collectFreshSkillPrimeNames,
   isSkillPrimeMessage,
   collectFileIds,
+  dedupeDocumentNames,
   processTextWithTokenLimit,
   logAgentMemorySnapshot,
   createAgentMemoryCallback,
@@ -201,6 +209,8 @@ const {
   markCompactionOutcome,
   resolvePersistableCodeEnvironmentDecision,
   getChatProjectContextKey,
+  isTemporaryTurn,
+  hasEntityEmbeddings,
 } = require('@librechat/api');
 const {
   Run,
@@ -235,6 +245,9 @@ const {
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { createContextHandlers } = require('~/app/clients/prompts');
+const {
+  getLinkedInstructionsResolver,
+} = require('~/server/services/Endpoints/agents/linkedInstructions');
 const { resolveConfigServers, getAccessibleMcpServerNames } = require('~/server/services/MCP');
 const { getMCPServerTools } = require('~/server/services/Config');
 const { getAccessibleMCPServers } = require('~/server/services/MCP');
@@ -593,8 +606,6 @@ class AgentClient extends BaseClient {
      * @type {string} */
     this.clientName = EModelEndpoint.agents;
 
-    /** @deprecated @type {true} - Is a Chat Completion Request */
-    this.isChatCompletion = true;
     /** @type {number | undefined} */
     this.jobCreatedAt = options.jobCreatedAt;
     /** Generation-scoped LangGraph checkpoint namespace. Legacy paused jobs
@@ -1636,8 +1647,8 @@ class AgentClient extends BaseClient {
       return undefined;
     }
     /** Per-endpoint opt-in via `activityLabel: true` in librechat.yaml,
-     *  resolved the same way the title options are (endpoints.all > named
-     *  endpoint > custom endpoint config). Custom endpoints live in the
+     *  resolved per field the same way the title options are (endpoints.all >
+     *  named endpoint > custom endpoint config). Custom endpoints live in the
      *  `endpoints.custom` ARRAY, so their settings are only visible through
      *  the matched entry — without it every custom endpoint reads as
      *  disabled. */
@@ -1979,11 +1990,11 @@ class AgentClient extends BaseClient {
 
     const agentsEConfig = this.options.req.config?.endpoints?.[EModelEndpoint.agents];
     const topLevelAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
-    const codeApprovalMode = resolveAttachedCodeApprovalMode(
-      this.options.req.body.codeApprovalMode,
-      collectAttachedCodeEnvironmentPolicySettings(topLevelAgents),
-      agentsEConfig?.toolApproval?.enabled !== false,
-    );
+    const codeApprovalMode = resolvePersistedCodeApprovalMode({
+      requested: this.options.req.body.codeApprovalMode,
+      policies: collectAttachedCodeApprovalPolicies(topLevelAgents),
+      approvalsEnabled: agentsEConfig?.toolApproval?.enabled !== false,
+    });
     const persistedCodeEnvironmentDecision = resolvePersistableCodeEnvironmentDecision({
       conversationId: this.options.req.body.conversationId,
       decision: this.options.req._codeEnvironmentDecision,
@@ -2010,6 +2021,17 @@ class AgentClient extends BaseClient {
         runOptions,
       ),
     );
+  }
+
+  getTurnConversationFields(options, conversationId, endpointOptions, context) {
+    const topLevelAgents = [options.agent, ...(this.agentConfigs?.values() ?? [])];
+    return {
+      ...super.getTurnConversationFields(options, conversationId, endpointOptions, context),
+      preservedFields: getCodeApprovalPreservedFields(
+        collectAttachedCodeApprovalPolicies(topLevelAgents),
+        options.req?.config?.endpoints?.[EModelEndpoint.agents]?.toolApproval?.enabled !== false,
+      ),
+    };
   }
 
   /**
@@ -2881,6 +2903,8 @@ class AgentClient extends BaseClient {
         }
       }
     }
+    /** After the steer stamp, which adds replayed steers' documents of its own. */
+    dedupeDocumentNames(payload);
     if (hasFileContext) {
       for (let i = 0; i < orderedMessages.length; i++) {
         memoryPayload.push(
@@ -3097,6 +3121,7 @@ class AgentClient extends BaseClient {
         logger,
         mcpManager,
         configServers,
+        user: this.options.req.user,
         sharedRunContext: agentRunContextParts.filter(Boolean).join('\n\n'),
         ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
       });
@@ -3390,10 +3415,19 @@ class AgentClient extends BaseClient {
         codeEnvAvailable: memoryCodeEnabled && memoryToolGrants?.runCode === true,
         statefulSessionsAvailable: memoryCapabilities.has(AgentCapabilities.stateful_code_sessions),
         useChatProjectContext: false,
+        /** A saved memory agent may itself link its instructions to a native
+         *  prompt group; without a resolver `initializeAgent` falls back to
+         *  empty instructions for it. This path never counts a generation —
+         *  it primes memory extraction, not a model-facing turn the user
+         *  asked for. */
+        resolveLinkedInstructions: getLinkedInstructionsResolver(),
+        recordLinkedPromptUsage: false,
       },
       {
         getProjectFiles: db.getProjectFiles,
         getFiles: db.getFiles,
+        adoptLegacySearchEmbeddings: db.adoptLegacySearchEmbeddings,
+        hasEntityEmbeddings,
         getUserKey: db.getUserKey,
         getConvoFiles: db.getConvoFiles,
         getAccessibleMcpServerNames,
@@ -4421,37 +4455,42 @@ class AgentClient extends BaseClient {
       )
         ? captureCodeExecutionApprovalBinding(reachableAgents)
         : undefined;
-    const pendingAction = buildPendingAction(interruptPayload, {
-      streamId,
-      conversationId: this.conversationId,
-      // runId mirrors the LangGraph checkpoint namespace when the SDK provides it
-      // (its documented meaning), falling back to the response message id.
-      runId: interrupt.checkpointNs ?? this.responseMessageId,
-      responseMessageId: this.responseMessageId,
-      interruptId: interrupt.interruptId,
-      // thread_id was bound to conversationId at run config (config.configurable);
-      // fall back to it when the SDK doesn't echo threadId on the interrupt.
-      threadId: interrupt.threadId ?? this.conversationId,
-      ttlMs: getApprovalTtlMs(checkpointerCfg),
-      // Bind the pause to the authoritative project identity/revision. The key is
-      // server-only and is checked before provider/tool startup on resume.
-      projectContextKey: getChatProjectContextKey(this.options.req?.chatProjectContext),
-      expiresAt: this.options.req?._agentEventBindingRetention?.expiredAt,
-      // Pin the graph-determining request fields so resume can't rebuild this paused
-      // run on a different agent/tool set (esp. ephemeral agents, whose agent_id is
-      // undefined so the id guard can't tell two configs apart).
-      // Keep the legacy digest in its established field so an old replica can
-      // resume pauses written during a rolling deploy; current replicas also
-      // enforce the stricter code-environment-aware digest below.
-      requestFingerprint: computeLegacyAgentRequestFingerprint(this.options.req?.body ?? {}),
-      requestFingerprintV2: computeAgentRequestFingerprint(this.options.req?.body ?? {}),
-      // Persist those same fields verbatim so the resume route can REPLAY them — a
-      // reload/cross-replica resume can't reconstruct the ephemeral config client-side,
-      // so the server restores it and rebuilds the same graph (and the fingerprint matches).
-      resumeContext,
-      codeExecutionBinding,
-      toolApprovalAliases: collectAllowAlwaysAliases(interruptPayload, getRunMCPToolAliases(run)),
-    });
+    const toolApprovalBindings = captureRunToolApprovalBindings(run, interruptPayload);
+    const pendingAction = buildPendingAction(
+      describeRememberedToolApprovals(interruptPayload, toolApprovalBindings, run),
+      {
+        streamId,
+        conversationId: this.conversationId,
+        // runId mirrors the LangGraph checkpoint namespace when the SDK provides it
+        // (its documented meaning), falling back to the response message id.
+        runId: interrupt.checkpointNs ?? this.responseMessageId,
+        responseMessageId: this.responseMessageId,
+        interruptId: interrupt.interruptId,
+        // thread_id was bound to conversationId at run config (config.configurable);
+        // fall back to it when the SDK doesn't echo threadId on the interrupt.
+        threadId: interrupt.threadId ?? this.conversationId,
+        ttlMs: getApprovalTtlMs(checkpointerCfg),
+        // Bind the pause to the authoritative project identity/revision. The key is
+        // server-only and is checked before provider/tool startup on resume.
+        projectContextKey: getChatProjectContextKey(this.options.req?.chatProjectContext),
+        expiresAt: this.options.req?._agentEventBindingRetention?.expiredAt,
+        // Pin the graph-determining request fields so resume can't rebuild this paused
+        // run on a different agent/tool set (esp. ephemeral agents, whose agent_id is
+        // undefined so the id guard can't tell two configs apart).
+        // Keep the legacy digest in its established field so an old replica can
+        // resume pauses written during a rolling deploy; current replicas also
+        // enforce the stricter code-environment-aware digest below.
+        requestFingerprint: computeLegacyAgentRequestFingerprint(this.options.req?.body ?? {}),
+        requestFingerprintV2: computeAgentRequestFingerprint(this.options.req?.body ?? {}),
+        // Persist those same fields verbatim so the resume route can REPLAY them — a
+        // reload/cross-replica resume can't reconstruct the ephemeral config client-side,
+        // so the server restores it and rebuilds the same graph (and the fingerprint matches).
+        resumeContext,
+        codeExecutionBinding,
+        toolApprovalAliases: collectAllowAlwaysAliases(interruptPayload, getRunMCPToolAliases(run)),
+      },
+    );
+    pendingAction.toolApprovalBindings = toolApprovalBindings;
 
     // Job-replacement guard: streamId == conversationId is reused per conversation, so a
     // newer request can replace this run's job. If this (older) run hits an interrupt
@@ -4546,7 +4585,7 @@ class AgentClient extends BaseClient {
         collectAttachedCodeEnvironmentPolicySettings(topLevelAgents);
       const codeApprovalMode = resolveAttachedCodeApprovalMode(
         this.options.req.body.codeApprovalMode,
-        attachedCodeEnvironmentSettings,
+        collectAttachedCodeApprovalPolicies(topLevelAgents),
         agentsEConfig?.toolApproval?.enabled !== false,
       );
       const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
@@ -4567,6 +4606,7 @@ class AgentClient extends BaseClient {
           attachedCodeEnvironmentAgentIds,
           attachedCodeEnvironmentSettings,
           codeApprovalMode,
+          collectAttachedCodeRoutePolicies(topLevelAgents),
         ),
       ];
       const askUserQuestionAdminDisabled = isAskUserQuestionAdminDisabled(appConfig);
@@ -4915,33 +4955,6 @@ class AgentClient extends BaseClient {
         );
         config = withPrivateTextAdmissionConfig(config, initialModelBoundAdmission);
 
-        // TODO: needs to be added as part of AgentContext initialization
-        // const noSystemModelRegex = [/\b(o1-preview|o1-mini|amazon\.titan-text)\b/gi];
-        // const noSystemMessages = noSystemModelRegex.some((regex) =>
-        //   agent.model_parameters.model.match(regex),
-        // );
-        // if (noSystemMessages === true && systemContent?.length) {
-        //   const latestMessageContent = _messages.pop().content;
-        //   if (typeof latestMessageContent !== 'string') {
-        //     latestMessageContent[0].text = [systemContent, latestMessageContent[0].text].join('\n');
-        //     _messages.push(new HumanMessage({ content: latestMessageContent }));
-        //   } else {
-        //     const text = [systemContent, latestMessageContent].join('\n');
-        //     _messages.push(new HumanMessage(text));
-        //   }
-        // }
-        // let messages = _messages;
-        // if (agent.useLegacyContent === true) {
-        //   messages = formatContentStrings(messages);
-        // }
-        // if (
-        //   agent.model_parameters?.clientOptions?.defaultHeaders?.['anthropic-beta']?.includes(
-        //     'prompt-caching',
-        //   )
-        // ) {
-        //   messages = addCacheControl(messages);
-        // }
-
         if (this.processMemory && !isCompactionTurn) {
           memoryPromise = this.runMemory(memoryMessages);
         }
@@ -5030,6 +5043,7 @@ class AgentClient extends BaseClient {
           // Conversation-stable identity for the e2e run hook; a resumed run
           // carries no messages, so history cannot identify the conversation.
           conversationId: this.conversationId,
+          isTemporary: isTemporaryTurn(this.options.req),
           messages,
           discoveredToolNames:
             this.eventActorContinuation === 'warm' ? this.eventActorDiscoveredToolNames : undefined,
@@ -5043,6 +5057,7 @@ class AgentClient extends BaseClient {
           // opts into the tool-approval wiring. Non-resumable callers (OpenAI-compat, Responses)
           // leave this off so an approval-gated tool can't pause where there's no resume path.
           hitlCapable: true,
+          toolApprovalStorage: db,
           resolvedToolApprovalHooks,
           toolApprovalAllows: resolveRunToolApprovalAllows(
             agentsEConfig?.toolApproval,
@@ -5407,6 +5422,7 @@ class AgentClient extends BaseClient {
    */
   async resumeCompletion({
     resumeValue,
+    reviewedToolApprovals,
     seedContent = [],
     runSteps = [],
     storedMessages = [],
@@ -5649,6 +5665,7 @@ class AgentClient extends BaseClient {
               logger,
               mcpManager: resumeMcpManager,
               configServers: resumeConfigServers,
+              user: this.options.req.user,
               sharedRunContext: scopedContext ?? '',
               ephemeralAgent:
                 agent === this.options.agent ? this.options.req.body.ephemeralAgent : undefined,
@@ -5751,6 +5768,7 @@ class AgentClient extends BaseClient {
                   logger,
                   mcpManager: resumeMcpManager,
                   configServers: resumeConfigServers,
+                  user: this.options.req.user,
                   sharedRunContext: scopedContext ?? '',
                 });
                 assertModelBoundContent({
@@ -5835,6 +5853,7 @@ class AgentClient extends BaseClient {
         ),
         agents,
         conversationId: this.conversationId,
+        isTemporary: isTemporaryTurn(this.options.req),
         modelCallbacks: [
           modelBoundCallback,
           attachmentMemoryCallback,
@@ -5846,6 +5865,8 @@ class AgentClient extends BaseClient {
         // The resumed run can pause AGAIN (another tool, a follow-up question), and this
         // controller owns that lifecycle, so it must keep the HITL wiring on the rebuilt run.
         hitlCapable: true,
+        toolApprovalStorage: db,
+        reviewedToolApprovals,
         resolvedToolApprovalHooks,
         toolApprovalAllows: resolveRunToolApprovalAllows(
           agentsEConfig?.toolApproval,
@@ -6130,34 +6151,29 @@ class AgentClient extends BaseClient {
 
     let titleProviderConfig = getProviderConfig({ provider: endpoint, appConfig });
 
-    /** @type {TEndpoint | undefined} */
-    const endpointConfig =
-      appConfig.endpoints?.all ??
-      appConfig.endpoints?.[endpoint] ??
-      titleProviderConfig.customEndpointConfig;
-    if (!endpointConfig) {
-      logger.debug(
-        `[api/server/controllers/agents/client.js #titleConvo] No endpoint config for "${endpoint}"`,
-      );
-    }
+    const titleConfig = resolveTitleConfig({
+      appConfig,
+      endpoint,
+      customEndpointConfig: titleProviderConfig.customEndpointConfig,
+    });
 
-    if (endpointConfig?.titleConvo === false) {
+    if (titleConfig.titleConvo === false) {
       logger.debug(
         `[api/server/controllers/agents/client.js #titleConvo] Title generation disabled for endpoint "${endpoint}"`,
       );
       return;
     }
 
-    if (endpointConfig?.titleEndpoint && endpointConfig.titleEndpoint !== endpoint) {
+    if (titleConfig.titleEndpoint && titleConfig.titleEndpoint !== endpoint) {
       try {
         titleProviderConfig = getProviderConfig({
-          provider: endpointConfig.titleEndpoint,
+          provider: titleConfig.titleEndpoint,
           appConfig,
         });
-        endpoint = endpointConfig.titleEndpoint;
+        endpoint = titleConfig.titleEndpoint;
       } catch (error) {
         logger.warn(
-          `[api/server/controllers/agents/client.js #titleConvo] Error getting title endpoint config for "${endpointConfig.titleEndpoint}", falling back to default`,
+          `[api/server/controllers/agents/client.js #titleConvo] Error getting title endpoint config for "${titleConfig.titleEndpoint}", falling back to default`,
           getSafeErrorMetadata(error),
         );
         // Fall back to original provider config
@@ -6166,12 +6182,8 @@ class AgentClient extends BaseClient {
       }
     }
 
-    if (
-      endpointConfig &&
-      endpointConfig.titleModel &&
-      endpointConfig.titleModel !== Constants.CURRENT_MODEL
-    ) {
-      clientOptions.model = endpointConfig.titleModel;
+    if (titleConfig.titleModel && titleConfig.titleModel !== Constants.CURRENT_MODEL) {
+      clientOptions.model = titleConfig.titleModel;
     }
 
     const options = await titleProviderConfig.getOptions({
@@ -6235,8 +6247,8 @@ class AgentClient extends BaseClient {
 
     if (
       provider === Providers.GOOGLE &&
-      (endpointConfig?.titleMethod === TitleMethod.FUNCTIONS ||
-        endpointConfig?.titleMethod === TitleMethod.STRUCTURED)
+      (titleConfig.titleMethod === TitleMethod.FUNCTIONS ||
+        titleConfig.titleMethod === TitleMethod.STRUCTURED)
     ) {
       clientOptions.json = true;
     }
@@ -6265,9 +6277,9 @@ class AgentClient extends BaseClient {
         clientOptions,
         inputText: text,
         contentParts: immediate ? [] : this.contentParts,
-        titleMethod: endpointConfig?.titleMethod,
-        titlePrompt: endpointConfig?.titlePrompt,
-        titlePromptTemplate: endpointConfig?.titlePromptTemplate,
+        titleMethod: titleConfig.titleMethod,
+        titlePrompt: titleConfig.titlePrompt,
+        titlePromptTemplate: titleConfig.titlePromptTemplate,
         chainOptions: {
           runName: 'TitleRun',
           signal: abortController.signal,

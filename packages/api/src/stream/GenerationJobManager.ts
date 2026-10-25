@@ -9,7 +9,7 @@ import {
   ApprovalEvents,
   SteerEvents,
   parseTextParts,
-  hasToolCallErrorPrefix,
+  isFailedToolOutput,
   reconcileContextUsageFromEvent,
 } from 'librechat-data-provider';
 import type {
@@ -45,6 +45,18 @@ import type { SteerContentView } from './SteeringLifecycle';
 import type { GenerationJobStore } from '~/app/metrics';
 import type * as t from '~/types';
 import {
+  GenerationPublicationFencedError,
+  JobCreationSupersededError,
+  JobPredecessorMismatchError,
+  GenerationAdmissionDeniedError,
+  GenerationAdmissionUnavailableError,
+  isPendingActionStale,
+  isPendingActionExpired,
+  PAUSE_PERSISTENCE_TIMEOUT_ERROR,
+  PROVIDER_DRAIN_TIMEOUT_MS,
+  STEER_QUEUE_MAX_DEPTH,
+} from './interfaces/IJobStore';
+import {
   recordGenerationStreamEarlyBufferOverflow,
   recordGenerationStreamResumePendingEvents,
   recordGenerationStreamSubscription,
@@ -53,19 +65,10 @@ import {
   setGenerationJobsInFlight,
   recordGenerationJob,
 } from '~/app/metrics';
-import {
-  GenerationPublicationFencedError,
-  JobCreationSupersededError,
-  JobPredecessorMismatchError,
-  isPendingActionStale,
-  isPendingActionExpired,
-  PAUSE_PERSISTENCE_TIMEOUT_ERROR,
-  PROVIDER_DRAIN_TIMEOUT_MS,
-  STEER_QUEUE_MAX_DEPTH,
-} from './interfaces/IJobStore';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
 import { projectTerminalEvent } from './terminalProjection';
 import { assertJobStoreV2 } from './jobStoreCapabilities';
+import { getSafeErrorMetadata } from '~/utils/errors';
 
 /**
  * Tombstone budget per generation. Twice the queue depth so a full queue's
@@ -92,6 +95,7 @@ import {
 } from './internal/timing';
 import { filterPersistableAbortContent } from './abortContent';
 import { toClientPendingAction } from '~/agents/hitl/policy';
+import { markAbortedCompactionContent } from '~/agents/compaction';
 import { ApprovalLifecycle, pausePersistenceActionId } from './ApprovalLifecycle';
 import { projectPendingMCPOAuthPrompts } from '~/mcp/oauth/resume';
 import { sanitizeJobMetadata } from './metadata';
@@ -129,13 +133,7 @@ function completedToolExecutionStatus(call: Agents.ToolCall): ToolExecutionStatu
   if (call.inputValidationError === true) {
     return 'error';
   }
-  const output = call.output;
-  return typeof output === 'string' &&
-    (hasToolCallErrorPrefix(output) ||
-      /^Error processing tool(?::|$)/i.test(output) ||
-      /^Error:[\s\S]*\n Please fix your mistakes\.$/i.test(output))
-    ? 'error'
-    : 'success';
+  return typeof call.output === 'string' && isFailedToolOutput(call.output) ? 'error' : 'success';
 }
 
 /** Bounded completed-request replay horizon. It exceeds the default 24-hour
@@ -148,6 +146,7 @@ const IDEMPOTENCY_TTL_SECONDS = 25 * 60 * 60;
 const LEGACY_IDEMPOTENCY_TTL_SECONDS = 26 * 60 * 60;
 const OAUTH_TOOL_CALL_PREFIX = `oauth${Constants.mcp_delimiter}`;
 const SHUTDOWN_SUBSCRIBER_ERROR = 'Server is shutting down';
+const ACCOUNT_DELETION_JOB_ERROR = 'Generation stopped because the account is being deleted';
 const SHUTDOWN_JOB_ERROR = 'Generation interrupted because its server shut down';
 const SHUTTING_DOWN_ERROR = 'Generation job manager is shutting down';
 /** Internal transport signal: durable terminal state exists, but its DONE
@@ -667,6 +666,8 @@ export type TerminalHostActionHandler = (
 ) => void | Promise<void>;
 
 export interface CreateGenerationJobOptions {
+  /** Replaces the installed admission guard for this job, for callers with a stricter predicate. */
+  admissionCheck?: (userId: string) => Promise<boolean>;
   startupTelemetry?: AgentStartupTelemetry;
   initialMetadata?: Partial<t.GenerationJobMetadata>;
   /** A terminal steer being handed off as this new normal turn. The store
@@ -891,6 +892,8 @@ type DeferredDelivery =
  * ```
  */
 class GenerationJobManagerClass {
+  private admissionGuard?: (userId: string) => Promise<boolean>;
+
   /** Job metadata + content state storage - swappable for Redis, etc. */
   private jobStore: IJobStoreV2;
   /** Guarded human-review lifecycle (pause / resolve / expire) over the store. */
@@ -987,6 +990,20 @@ class GenerationJobManagerClass {
     this._steering = new SteeringLifecycle(this.jobStore);
     this.eventTransport = options?.eventTransport ?? new InMemoryEventTransport();
     this._cleanupOnComplete = options?.cleanupOnComplete ?? true;
+    this.bindStaleGenerationHandler();
+  }
+
+  private bindStaleGenerationHandler(): void {
+    const store = this.jobStore;
+    store.setStaleGenerationHandler?.((streamId, createdAt) => {
+      if (this.jobStore !== store) return;
+      const runtime = this.runtimeState.get(streamId);
+      if (runtime?.createdAt !== createdAt) return;
+      this.releaseAbortSubscription(runtime);
+      runtime.abortController.abort();
+      this.releaseJobOwnership(streamId, createdAt);
+      // Keep buffers, subscribers and the open provider segment until its actual drain.
+    });
   }
 
   /**
@@ -1080,7 +1097,9 @@ class GenerationJobManagerClass {
     this.releaseOpenProviderExecutions();
     setGenerationJobsInFlight(previousStore, 0);
 
+    this.jobStore.setStaleGenerationHandler?.(undefined);
     this.jobStore = services.jobStore;
+    this.bindStaleGenerationHandler();
     this._approvals = this.createApprovalLifecycle(this.jobStore);
     this._steering = new SteeringLifecycle(this.jobStore);
     this.eventTransport = services.eventTransport;
@@ -1129,6 +1148,38 @@ class GenerationJobManagerClass {
    * stream package to any particular trigger/scheduler implementation. */
   setApprovalExpiredHandler(handler?: ApprovalExpiredHandler): void {
     this.approvalExpiredHandler = handler;
+  }
+
+  /**
+   * Installs the account admission check, which `createJob` runs before it creates any durable
+   * state. The caller supplies it, keeping the stream package storage-free.
+   */
+  setAdmissionGuard(guard?: (userId: string) => Promise<boolean>): void {
+    this.admissionGuard = guard;
+  }
+
+  private async assertAdmitted(
+    streamId: string,
+    userId: string,
+    options: CreateGenerationJobOptions,
+  ): Promise<void> {
+    const admissionCheck = options.admissionCheck ?? this.admissionGuard;
+    if (admissionCheck == null) {
+      return;
+    }
+    let admitted: boolean;
+    try {
+      admitted = await admissionCheck(userId);
+    } catch (error) {
+      logger.error(
+        `[GenerationJobManager] Admission check failed for ${streamId}:`,
+        getSafeErrorMetadata(error),
+      );
+      throw new GenerationAdmissionUnavailableError();
+    }
+    if (!admitted) {
+      throw new GenerationAdmissionDeniedError();
+    }
   }
 
   /** Installs a durable, generation-fenced terminal lifecycle adapter. */
@@ -2529,6 +2580,9 @@ class GenerationJobManagerClass {
       throw new Error('Invalid active generation predecessor policy');
     }
 
+    /** Refuse before any durable state exists; the common case leaves nothing to clean up. */
+    await this.assertAdmitted(streamId, userId, options);
+
     const tenantId = getTenantId();
     const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
     const creationAttemptId = randomUUID();
@@ -2720,7 +2774,21 @@ class GenerationJobManagerClass {
       }
       throw new Error('Generation job was replaced during initialization');
     }
-    if (this.shuttingDown) {
+    /**
+     * Race-free admission: account deletion sets its marker first and then lists this user's jobs.
+     * A job committed before that listing is stopped by the drain; a job committed after it
+     * checks the marker here, after the marker was set, and retires itself through the normal
+     * terminal path. The marker is therefore always seen by one side or the other.
+     */
+    let postCommitRefusal: Error | undefined;
+    if (!this.shuttingDown) {
+      try {
+        await this.assertAdmitted(streamId, userId, options);
+      } catch (error) {
+        postCommitRefusal = error as Error;
+      }
+    }
+    if (this.shuttingDown || postCommitRefusal != null) {
       await this.processDurableReplacementReceipts(streamId, jobData, conversationId).catch(
         (handoffError) => {
           logger.error(
@@ -2730,20 +2798,35 @@ class GenerationJobManagerClass {
           return false;
         },
       );
-      await this.completeJob(streamId, SHUTDOWN_JOB_ERROR, jobData.createdAt);
-      if (jobData.providerExecutionId) {
-        await this.markProviderExecutionDrained(
+      try {
+        await this.completeJob(
           streamId,
+          postCommitRefusal != null ? ACCOUNT_DELETION_JOB_ERROR : SHUTDOWN_JOB_ERROR,
           jobData.createdAt,
-          jobData.providerExecutionId,
         );
+        if (jobData.providerExecutionId) {
+          await this.markProviderExecutionDrained(
+            streamId,
+            jobData.createdAt,
+            jobData.providerExecutionId,
+          );
+        }
+        const replacedLocal = this.runtimeState.get(streamId);
+        if (replacedLocal != null && replacedLocal.createdAt < jobData.createdAt) {
+          replacedLocal.abortController.abort();
+          this.retireStoppedPredecessorRuntime(streamId, jobData.createdAt);
+        }
+      } catch (retireError) {
+        if (postCommitRefusal == null) {
+          throw retireError;
+        }
+        logger.error(
+          `[GenerationJobManager] Failed to retire refused generation ${streamId}:`,
+          getSafeErrorMetadata(retireError),
+        );
+        throw new GenerationAdmissionUnavailableError();
       }
-      const replacedLocal = this.runtimeState.get(streamId);
-      if (replacedLocal != null && replacedLocal.createdAt < jobData.createdAt) {
-        replacedLocal.abortController.abort();
-        this.retireStoppedPredecessorRuntime(streamId, jobData.createdAt);
-      }
-      throw new Error(SHUTTING_DOWN_ERROR);
+      throw postCommitRefusal ?? new Error(SHUTTING_DOWN_ERROR);
     }
 
     if (!(await this.processDurableReplacementReceipts(streamId, jobData, conversationId))) {
@@ -4893,6 +4976,13 @@ class GenerationJobManagerClass {
       // Filter only after the transform so sparse/empty/OAuth parts cannot
       // shift a retained ID-less ask answer onto a different tool call.
       abortContent = filterPersistableAbortContent(content);
+      // A stopped compaction is unfinished rather than failed, so the row keeps
+      // the abort shape, plus the marker that keeps it identifiable as the
+      // compaction's own turn instead of an answer to its parent.
+      abortContent = markAbortedCompactionContent(
+        abortContent as TMessageContentParts[],
+        jobData.compact === true,
+      );
       shouldPersistAbortContent = abortContent.length > 0;
       text = shouldPersistAbortContent
         ? parseTextParts(abortContent as TMessageContentParts[], false, {
@@ -9390,10 +9480,11 @@ class GenerationJobManagerClass {
         const currentJob = await this.jobStore.getJob(streamId);
         if (
           currentJob?.createdAt === observedRuntime.createdAt &&
-          currentJob.terminalHostActionPending === true
+          (currentJob.terminalHostActionPending === true ||
+            currentJob.terminalPersistencePending === true ||
+            currentJob.providerDrained === false)
         ) {
-          // The callback retry still owns this generation's evidence. Retain
-          // runtime buffers until it acknowledges and clears the durable marker.
+          // Persistence, provider drain and host acknowledgement still own this evidence.
           continue;
         }
         const isRetainedTerminal =
@@ -9742,6 +9833,7 @@ class GenerationJobManagerClass {
     await this.drainSubscriberCleanups();
     await this.awaitGenerationSettlements(Math.max(0, settlementDeadline - Date.now()));
     await this.finalizeOwnedJobsForShutdown();
+    this.jobStore.setStaleGenerationHandler?.(undefined);
     await this.jobStore.destroy();
     this.eventTransport.destroy();
     /** Whatever the bounded wait left behind must not outlive this store: a later

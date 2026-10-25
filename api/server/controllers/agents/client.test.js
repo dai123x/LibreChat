@@ -99,6 +99,94 @@ describe('AgentClient code approval persistence', () => {
     });
   });
 
+  /** Reproduces the "no workspace" failure: no agent has an attached execution context, yet the
+   *  request still carries the mode the reader picked for a workspace. */
+  const noWorkspaceClient = ({ requested, stored, agent = { id: 'terra' } }) => {
+    const client = Object.create(AgentClient.prototype);
+    client.agentConfigs = new Map();
+    client.conversationId = 'convo-1';
+    client.options = {
+      endpoint: EModelEndpoint.agents,
+      agent,
+      req: {
+        body: { conversationId: 'convo-1', codeApprovalMode: requested },
+        _codeEnvironmentDecision: { mode: 'without_attached' },
+        resolvedConversation: {
+          conversationId: 'convo-1',
+          codeEnvironmentMode: 'without_attached',
+          ...(stored != null && { codeApprovalMode: stored }),
+        },
+        config: { endpoints: { [EModelEndpoint.agents]: {} } },
+      },
+    };
+    return client;
+  };
+
+  /** The write `BaseClient` performs with these options: an omitted key is `$unset` from the
+   *  stored row unless the write preserves it. */
+  const turnWrite = (client) =>
+    client.getTurnConversationFields(
+      client.options,
+      'convo-1',
+      client.getSaveOptions(),
+      'client.test approval mode',
+    );
+
+  it.each(['fullAccess', 'acceptEdits', 'ask', undefined])(
+    'saves a turn without a workspace that carries %s, keeping the stored mode as it is',
+    (requested) => {
+      const write = turnWrite(noWorkspaceClient({ requested, stored: 'acceptEdits' }));
+      expect(write.endpointOptions).not.toHaveProperty('codeApprovalMode');
+      expect(write.preservedFields).toEqual(['codeApprovalMode']);
+    },
+  );
+
+  it('preserves nothing once the turn runs on an attached machine', () => {
+    const agent = {
+      id: 'terra',
+      codeExecutionContext: {
+        environmentId: 'terra-vm',
+        environmentType: 'attached',
+        codeEnvironmentConfigSchema: {
+          permissions: { fileWrite: { allowed: ['allow', 'ask'], default: 'ask' } },
+        },
+      },
+    };
+    const write = turnWrite(noWorkspaceClient({ requested: 'acceptEdits', agent }));
+    expect(write.endpointOptions).toMatchObject({ codeApprovalMode: 'acceptEdits' });
+    expect(write.preservedFields).toEqual([]);
+  });
+
+  it('still rejects a value that is not an approval mode without a workspace', () => {
+    expect(() =>
+      noWorkspaceClient({ requested: 'unrestricted', stored: 'fullAccess' }).getSaveOptions(),
+    ).toThrow('not permitted');
+  });
+
+  it('validates the mode against a subagent machine when the parent has no workspace', () => {
+    const agent = {
+      id: 'terra',
+      lazySubagentConfigs: [
+        {
+          id: 'builder',
+          codeExecutionContext: {
+            environmentId: 'builder-vm',
+            environmentType: 'attached',
+            codeEnvironmentConfigSchema: {
+              permissions: { fileWrite: { allowed: ['ask'], default: 'ask' } },
+            },
+          },
+        },
+      ],
+    };
+    expect(() =>
+      noWorkspaceClient({ requested: 'fullAccess', stored: 'fullAccess', agent }).getSaveOptions(),
+    ).toThrow('not permitted');
+    expect(
+      noWorkspaceClient({ requested: 'ask', stored: 'fullAccess', agent }).getSaveOptions(),
+    ).toMatchObject({ codeApprovalMode: 'ask' });
+  });
+
   it('never writes its run-start decision over a stored one a move replaced', () => {
     const client = Object.create(AgentClient.prototype);
     client.agentConfigs = new Map();
@@ -1963,6 +2051,11 @@ jest.mock('~/server/services/MCP', () => ({
   resolveConfigServers: jest.fn().mockResolvedValue({}),
 }));
 
+const mockLinkedInstructionsResolver = jest.fn();
+jest.mock('~/server/services/Endpoints/agents/linkedInstructions', () => ({
+  getLinkedInstructionsResolver: jest.fn(() => mockLinkedInstructionsResolver),
+}));
+
 jest.mock('~/models', () => ({
   bulkInsertTransactions: jest.fn(),
   getCacheMultiplier: jest.fn(),
@@ -2208,6 +2301,55 @@ describe('AgentClient - startup telemetry', () => {
     jest.restoreAllMocks();
   });
 
+  it.each([false, true])(
+    'bounds ordinary-chat admission before provider startup (legacy=%s)',
+    async (legacy) => {
+      const createRunBefore = mockCreateRun.mock.calls.length;
+      const name = 'q' + '_mcp_z'.repeat(legacy ? 4000 : 80);
+      const tool_options = Object.fromEntries(
+        Array.from({ length: legacy ? 1 : 100 }, (_, i) => [
+          `${i}_${name}`,
+          { approval_mode: 'ask' },
+        ]),
+      );
+      const client = new AgentClient({
+        req: {
+          user: { id: 'user-123' },
+          body: {},
+          config: {
+            endpoints: {
+              [EModelEndpoint.agents]: { toolApproval: { enabled: true, mode: 'bypass' } },
+            },
+          },
+        },
+        res: {},
+        agent: {
+          id: 'agent-123',
+          endpoint: EModelEndpoint.openAI,
+          provider: EModelEndpoint.openAI,
+          model_parameters: { model: 'gpt-4' },
+          tools: [],
+          lazySubagentConfigs: [{ id: 'child', tools: ['other_mcp_unknown'], tool_options }],
+        },
+        endpointTokenConfig: {},
+        eventHandlers: {},
+        contentParts: [],
+        collectedUsage: [],
+        artifactPromises: [],
+      });
+      client.conversationId = 'bounded-approval-admission';
+      client.responseMessageId = 'bounded-response';
+      client.parentMessageId = 'bounded-parent';
+
+      await client.chatCompletion({ payload: [] });
+
+      expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+      expect(client.contentParts).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
+      );
+    },
+  );
+
   it('refuses scheduled pause-capable runs before provider startup without Redis', async () => {
     mockIsHITLEnabled.mockReturnValue(false);
     const createRunBefore = mockCreateRun.mock.calls.length;
@@ -2290,6 +2432,14 @@ describe('AgentClient - startup telemetry', () => {
   });
 
   it.each([
+    ...['ask', 'chat', 'always'].map((mode) => ({
+      name: `a deselected MCP tool retaining ${mode} mode`,
+      toolApproval: { enabled: true, mode: 'bypass', agentModes: true },
+      tool_options: {
+        deselected_mcp_db: { approval_mode: mode },
+        read_file: { approval_mode: 'allow' },
+      },
+    })),
     {
       name: 'a bypass-only approval policy',
       toolApproval: { enabled: true, mode: 'bypass' },
@@ -2298,6 +2448,44 @@ describe('AgentClient - startup telemetry', () => {
     {
       name: 'an approval rule that matches no selected tool',
       toolApproval: { enabled: true, mode: 'bypass', ask: ['approval_probe'] },
+      subagentAgentConfigs: undefined,
+    },
+    {
+      name: 'dontAsk denied attached-code lazy graph member',
+      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['read_file'] },
+      primaryTools: [{ name: 'read_file' }],
+      subagentAgentConfigs: [
+        {
+          id: 'lazy-parent',
+          subagentGraphMemberMetadata: [
+            {
+              id: 'attached-member',
+              codeExecutionContext: { environmentType: 'attached' },
+              skillAuthoringAvailable: true,
+            },
+          ],
+        },
+      ],
+    },
+    {
+      name: 'dontAsk fallback-denied ask agent tool',
+      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['safe_mcp_db'] },
+      primaryTools: [{ name: 'query_mcp_db' }, { name: 'safe_mcp_db' }],
+      tool_options: { query_mcp_db: { approval_mode: 'ask' } },
+      subagentAgentConfigs: undefined,
+    },
+    {
+      name: 'dontAsk fallback-denied chat agent tool',
+      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['safe_mcp_db'] },
+      primaryTools: [{ name: 'query_mcp_db' }, { name: 'safe_mcp_db' }],
+      tool_options: { query_mcp_db: { approval_mode: 'chat' } },
+      subagentAgentConfigs: undefined,
+    },
+    {
+      name: 'dontAsk fallback-denied always agent tool',
+      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['safe_mcp_db'] },
+      primaryTools: [{ name: 'query_mcp_db' }, { name: 'safe_mcp_db' }],
+      tool_options: { query_mcp_db: { approval_mode: 'always' } },
       subagentAgentConfigs: undefined,
     },
     {
@@ -2318,7 +2506,7 @@ describe('AgentClient - startup telemetry', () => {
     },
   ])(
     'does not reject scheduled runs for $name',
-    async ({ toolApproval, primaryTools, subagentAgentConfigs }) => {
+    async ({ toolApproval, primaryTools, subagentAgentConfigs, tool_options }) => {
       mockDeleteAgentCheckpoint.mockReset().mockResolvedValue(undefined);
       const processStream = jest.fn().mockResolvedValue();
       mockCreateRun.mockResolvedValueOnce({
@@ -2345,6 +2533,7 @@ describe('AgentClient - startup telemetry', () => {
           hide_sequential_outputs: false,
           tools: primaryTools ?? [{ name: 'read_file' }],
           subagentAgentConfigs,
+          tool_options,
         },
         endpointTokenConfig: {},
         eventHandlers: {},
@@ -2373,6 +2562,124 @@ describe('AgentClient - startup telemetry', () => {
         );
       } else {
         expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([
+    {
+      name: 'selected review-gated tool',
+      tools: [{ name: 'query_mcp_db' }],
+      tool_options: { query_mcp_db: { approval_mode: 'ask' } },
+    },
+    {
+      name: 'selected tool with verified legacy mode',
+      tools: [{ name: 'query_mcp_db' }],
+      tool_options: { db_query_mcp_db: { approval_mode: 'chat' } },
+      mcpToolAliases: [{ name: 'query_mcp_db', aliasName: 'db_query_mcp_db' }],
+    },
+    {
+      name: 'unresolved lazy review-gated child',
+      tools: [{ name: 'read_file' }],
+      lazySubagentConfigs: [
+        { id: 'lazy-agent', tool_options: { query_mcp_db: { approval_mode: 'always' } } },
+      ],
+    },
+  ])(
+    'rejects scheduled memory-store runs with a $name before provider execution',
+    async (surface) => {
+      const createRunBefore = mockCreateRun.mock.calls.length;
+      const client = new AgentClient({
+        req: {
+          user: { id: 'user-123' },
+          body: {},
+          config: {
+            endpoints: {
+              [EModelEndpoint.agents]: {
+                toolApproval: { enabled: true, mode: 'bypass', agentModes: true },
+              },
+            },
+          },
+          _isScheduledFire: true,
+          _resumableStreamId: 'scheduled-agent-mode',
+        },
+        res: {},
+        agent: {
+          id: 'agent-123',
+          endpoint: EModelEndpoint.openAI,
+          provider: EModelEndpoint.openAI,
+          model_parameters: { model: 'gpt-4' },
+          ...surface,
+        },
+        endpointTokenConfig: {},
+        eventHandlers: {},
+        contentParts: [],
+        collectedUsage: [],
+        artifactPromises: [],
+      });
+      client.conversationId = 'scheduled-agent-mode';
+      client.responseMessageId = 'scheduled-agent-mode-response';
+      client.parentMessageId = 'scheduled-agent-mode-parent';
+      await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
+        code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
+      });
+      expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+    },
+  );
+
+  it.each(['db', 'Db', 'dB', 'DB'])(
+    'refuses unresolved %s legacy-hook schedules before provider startup under canonical dontAsk allow',
+    async (prefix) => {
+      mockIsHITLEnabled.mockReturnValue(true);
+      const hook = jest.fn(async () => ({ decision: 'ask' }));
+      const unregister = registerToolApprovalHook(() => hook, {
+        matcher: `^${prefix}_query_mcp_db$`,
+      });
+      const createRunBefore = mockCreateRun.mock.calls.length;
+      const client = new AgentClient({
+        req: {
+          user: { id: 'user-123' },
+          body: {},
+          config: {
+            endpoints: {
+              [EModelEndpoint.agents]: {
+                toolApproval: {
+                  enabled: true,
+                  mode: 'dontAsk',
+                  allow: ['query_mcp_db', 'subagent'],
+                },
+              },
+            },
+          },
+          _isScheduledFire: true,
+          _resumableStreamId: 'scheduled-legacy-hook',
+        },
+        res: {},
+        agent: {
+          id: 'agent-123',
+          endpoint: EModelEndpoint.openAI,
+          provider: EModelEndpoint.openAI,
+          model_parameters: { model: 'gpt-4' },
+          tools: [{ name: 'subagent' }],
+          lazySubagentConfigs: [{ id: 'lazy-child', tools: ['query_mcp_db'] }],
+        },
+        endpointTokenConfig: {},
+        eventHandlers: {},
+        contentParts: [],
+        collectedUsage: [],
+        artifactPromises: [],
+      });
+      client.conversationId = 'scheduled-legacy-hook';
+      client.responseMessageId = 'scheduled-legacy-hook-response';
+      client.parentMessageId = 'scheduled-legacy-hook-parent';
+      try {
+        await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
+          code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
+        });
+        expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+        expect(hook).not.toHaveBeenCalled();
+      } finally {
+        unregister();
       }
     },
   );
@@ -4561,6 +4868,96 @@ describe('AgentClient - titleConvo', () => {
       expect(generateTitleCall.clientOptions.model).toBe('gpt-4o-mini');
     });
 
+    it('keeps endpoint title settings when the all block sets only unrelated keys', async () => {
+      mockReq.config = {
+        endpoints: {
+          all: { streamRate: 1, headers: { 'x-gateway': 'title' } },
+          [EModelEndpoint.openAI]: {
+            titleModel: 'gpt-3.5-turbo',
+            titlePrompt: 'Endpoint title prompt',
+            titleMethod: 'structured',
+          },
+        },
+      };
+
+      await client.titleConvo({ text: 'Test', abortController: new AbortController() });
+
+      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
+      expect(generateTitleCall).toEqual(
+        expect.objectContaining({
+          titleMethod: 'structured',
+          titlePrompt: 'Endpoint title prompt',
+        }),
+      );
+    });
+
+    it('resolves each title field on its own across the all and endpoint blocks', async () => {
+      mockReq.config = {
+        endpoints: {
+          all: { titlePrompt: 'All config title prompt' },
+          [EModelEndpoint.openAI]: {
+            titleModel: 'gpt-3.5-turbo',
+            titlePrompt: 'Endpoint title prompt',
+            titleMethod: 'structured',
+          },
+        },
+      };
+
+      await client.titleConvo({ text: 'Test', abortController: new AbortController() });
+
+      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
+      expect(generateTitleCall).toEqual(
+        expect.objectContaining({
+          titleMethod: 'structured',
+          titlePrompt: 'All config title prompt',
+        }),
+      );
+    });
+
+    it('skips titles when the endpoint disables them beside an unrelated all block', async () => {
+      mockReq.config = {
+        endpoints: {
+          all: { streamRate: 1 },
+          [EModelEndpoint.openAI]: { titleConvo: false, titleModel: 'gpt-3.5-turbo' },
+        },
+      };
+
+      const result = await client.titleConvo({
+        text: 'Test',
+        abortController: new AbortController(),
+      });
+
+      expect(result).toBeUndefined();
+      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+    });
+
+    it('does not run the endpoint titleModel on a titleEndpoint the all block names', async () => {
+      const originalApiKey = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+      mockReq.config = {
+        endpoints: {
+          all: { titleEndpoint: EModelEndpoint.anthropic },
+          [EModelEndpoint.openAI]: { titleModel: 'gpt-3.5-turbo' },
+        },
+      };
+
+      try {
+        await client.titleConvo({ text: 'Test', abortController: new AbortController() });
+      } finally {
+        if (originalApiKey) {
+          process.env.ANTHROPIC_API_KEY = originalApiKey;
+        } else {
+          delete process.env.ANTHROPIC_API_KEY;
+        }
+      }
+
+      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      expect(generateTitleCall.provider).toBe(Providers.ANTHROPIC);
+      expect(generateTitleCall.clientOptions.model).not.toBe('gpt-3.5-turbo');
+    });
+
     it('should use all config with titleEndpoint and verify provider switch', async () => {
       // Mock the API key for the titleEndpoint provider
       const originalApiKey = process.env.ANTHROPIC_API_KEY;
@@ -5414,7 +5811,7 @@ describe('AgentClient - titleConvo', () => {
       });
 
       // Verify formatInstructionsForContext was called with correct server names
-      expect(mockFormatInstructions).toHaveBeenCalledWith(['server1', 'server2'], {});
+      expect(mockFormatInstructions).toHaveBeenCalledWith(['server1', 'server2'], {}, mockReq.user);
 
       // Verify the instructions do NOT contain [object Promise]
       expect(client.options.agent.instructions).not.toContain('[object Promise]');
@@ -5496,6 +5893,7 @@ describe('AgentClient - titleConvo', () => {
       expect(mockFormatInstructions).toHaveBeenCalledWith(
         ['ephemeral-server1', 'ephemeral-server2'],
         {},
+        mockReq.user,
       );
 
       // Verify no [object Promise] in instructions
@@ -6035,6 +6433,49 @@ describe('AgentClient - titleConvo', () => {
 
       expect(client.contextMeta).toEqual(expectSeed ? contextMeta : undefined);
       expect(client.publishRunContextMeta).toHaveBeenCalledTimes(expectSeed ? 1 : 0);
+    });
+
+    it('gives every resent document a unique name before formatting', async () => {
+      const bedrockDocument = (name) => ({
+        type: 'document',
+        document: { name, format: 'pdf', source: { bytes: Buffer.from(name) } },
+      });
+      const firstQuestion = {
+        messageId: 'user-first',
+        parentMessageId: null,
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'Summarize the fees.',
+        documents: [bedrockDocument('Stripe fees')],
+      };
+      const answer = {
+        messageId: 'assistant-first',
+        parentMessageId: 'user-first',
+        sender: 'Assistant',
+        isCreatedByUser: false,
+        text: 'Here is the summary.',
+      };
+      const secondQuestion = {
+        messageId: 'user-second',
+        parentMessageId: 'assistant-first',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: 'Compare with this one.',
+        documents: [bedrockDocument('Stripe fees')],
+      };
+      const messages = [firstQuestion, answer, secondQuestion];
+      client.setModelBoundStoredMessages(messages);
+
+      const result = await client.buildMessages(messages, 'user-second', {}, {});
+
+      const names = result.prompt.flatMap((message) =>
+        Array.isArray(message.content)
+          ? message.content
+              .filter((part) => part?.type === 'document')
+              .map((part) => part.document.name)
+          : [],
+      );
+      expect(names).toEqual(['Stripe fees', 'Stripe fees (2)']);
     });
 
     it('preserves persisted source identity through both agent formatting passes', async () => {
@@ -8776,6 +9217,29 @@ describe('AgentClient - titleConvo', () => {
       );
     });
 
+    it('passes the shared linked-instructions resolver, without recording usage, so a linked memory agent still resolves its instructions', async () => {
+      mockCheckAccess.mockResolvedValue(true);
+      mockInitializeAgent.mockResolvedValue({
+        ...mockAgent,
+        provider: EModelEndpoint.openAI,
+      });
+      mockCreateMemoryProcessor.mockResolvedValue([undefined, jest.fn()]);
+
+      client = new AgentClient(mockOptions);
+      client.conversationId = 'convo-123';
+      client.responseMessageId = 'response-123';
+
+      await client.useMemory();
+
+      expect(mockInitializeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resolveLinkedInstructions: mockLinkedInstructionsResolver,
+          recordLinkedPromptUsage: false,
+        }),
+        expect.any(Object),
+      );
+    });
+
     it('should bind memory processing to the current generation epoch', async () => {
       mockReq._resumableStreamId = 'convo-123';
       mockCheckAccess.mockResolvedValue(true);
@@ -9198,6 +9662,61 @@ describe('AgentClient - finalizeSubagentContent', () => {
     /** Buffer drained so a second call (e.g. resumable retry) doesn't
      *  double-append. */
     expect(buffer.size).toBe(0);
+  });
+
+  it('persists before/steer/after without a private child journal or duplicate offset', async () => {
+    const part = {
+      type: 'steer',
+      steer: 'Use the revised sources',
+      steerId: 'steer-1',
+      clientSteerId: 'client-steer-1',
+      createdAt: 1234,
+      quotes: ['quoted guidance'],
+      files: [{ file_id: 'public-file' }],
+    };
+    const applied = event('steer_applied', {
+      index: 1,
+      steerId: part.steerId,
+      clientSteerId: part.clientSteerId,
+      part,
+    });
+    const buffer = await runSubagentEvents([
+      event('run_step', {
+        id: 'before-step',
+        index: 0,
+        stepDetails: { type: 'message_creation' },
+      }),
+      event('message_delta', {
+        id: 'before-step',
+        delta: { content: [{ type: 'text', text: 'before' }] },
+      }),
+      applied,
+      event('run_step', {
+        id: 'after-step',
+        index: 2,
+        stepDetails: { type: 'message_creation' },
+      }),
+      event('message_delta', {
+        id: 'after-step',
+        delta: { content: [{ type: 'text', text: 'after' }] },
+      }),
+      applied,
+    ]);
+    const client = makeClient(buffer);
+    client.options.req.config.subagentActivity = { enabled: false };
+    client.contentParts = [
+      { type: 'tool_call', tool_call: { id: 'call_sub', name: Constants.SUBAGENT } },
+    ];
+    client.finalizeSubagentContent();
+    const attached = client.contentParts[0].tool_call.subagent_content;
+    expect(attached).toEqual([
+      { type: 'text', text: 'before' },
+      part,
+      { type: 'text', text: 'after' },
+    ]);
+    expect(buffer.size).toBe(0);
+    client.finalizeSubagentContent();
+    expect(client.contentParts[0].tool_call.subagent_content).toEqual(attached);
   });
 
   it('stamps durable MCP server identity onto nested persisted tool calls', () => {

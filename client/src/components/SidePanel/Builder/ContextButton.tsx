@@ -101,12 +101,12 @@ export default function ContextButton({
       </DialogTrigger>
       <DialogTemplate
         title={localize('com_ui_delete_assistant')}
-        className="max-w-[450px]"
+        className="max-w-[28.125rem]"
         main={
           <>
             <div className="flex w-full flex-col items-center gap-2">
               <div className="grid w-full items-center gap-2">
-                <Label htmlFor="delete-assistant" className="text-left text-sm font-medium">
+                <Label htmlFor="delete-assistant" className="text-start text-sm font-medium">
                   {localize('com_ui_delete_assistant_confirm')}
                 </Label>
               </div>
